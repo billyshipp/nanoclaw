@@ -22,6 +22,7 @@ import {
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
+  stripStrayToolTags,
   type RoutingContext,
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
@@ -502,7 +503,7 @@ export async function processQuery(
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
-          const { sent, hasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
+          const { sent, hasUnwrapped, emptyBlocks, taskBlocks } = dispatchResultText(event.text, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
           // while explicit append-log calls remain optional additive notes.
@@ -524,22 +525,25 @@ export async function processQuery(
             });
             archivePrompts.shift();
           } else {
-            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            // Nudge when the turn produced text but nothing reached the user:
+            // either bare/unwrapped output, or only empty <message> blocks.
+            const needsRewrap = hasUnwrapped || emptyBlocks > 0;
+            const willRetryWrapping = needsRewrap && !unwrappedNudged;
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
+              status: needsRewrap || willRetryTaskBlocks ? 'undelivered' : 'completed',
             });
             if (willRetryWrapping) {
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
               query.push(
-                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                `<system>Your response was not delivered — it was empty or not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                   `Your destinations: ${names}. ` +
-                  `Please re-send your response with the correct wrapping.</system>`,
+                  `Please re-send your response with the correct wrapping and actual content.</system>`,
               );
             }
             if (willRetryTaskBlocks) {
@@ -641,11 +645,12 @@ export interface TaskMessageBlock {
 export function dispatchResultText(
   text: string,
   routing: RoutingContext,
-): { sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[] } {
+): { sent: number; hasUnwrapped: boolean; emptyBlocks: number; taskBlocks: TaskMessageBlock[] } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
+  let emptyBlocks = 0;
   // <message to> blocks left inert in a task run — drives the same-turn
   // "use send_message" nudge in processQuery.
   const taskBlocks: TaskMessageBlock[] = [];
@@ -657,7 +662,10 @@ export function dispatchResultText(
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
-    const body = match[2].trim();
+    // Strip stray tool-call tag fragments (e.g. `</parameter>`) that can
+    // survive into the SDK's aggregated final text from a truncated or
+    // misclassified tool_use block — never real message content.
+    const body = stripStrayToolTags(match[2]);
     lastIndex = MESSAGE_RE.lastIndex;
 
     // One-door delivery in task sessions: only the send_message tool delivers.
@@ -676,6 +684,16 @@ export function dispatchResultText(
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
+      continue;
+    }
+    // An empty block (`<message to="x"></message>`) means the agent opened a
+    // message to a real destination but produced no content. Don't dispatch
+    // it — an empty outbound row renders downstream as a blank/garbage message
+    // (e.g. the literal `{"text":""}`). Count it so the caller can nudge the
+    // agent to actually produce an answer.
+    if (body === '') {
+      log(`Empty <message to="${toName}"> block — nothing to send`);
+      emptyBlocks++;
       continue;
     }
     sendToDestination(dest, body, routing);
@@ -697,7 +715,7 @@ export function dispatchResultText(
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
-  return { sent, hasUnwrapped, taskBlocks };
+  return { sent, hasUnwrapped, emptyBlocks, taskBlocks };
 }
 
 /**
@@ -748,7 +766,7 @@ export function autoAppendTaskLog(text: string): void {
     /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g,
     (_m, to: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
   );
-  const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
+  const line = stripStrayToolTags(stripInternalTags(prose)).replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!line) return;
   writeMessageOut({
     id: generateId(),

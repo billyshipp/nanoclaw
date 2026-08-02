@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags, stripLegacyTaskContract } from './formatter.js';
+import { formatMessages, stripInternalTags, stripStrayToolTags, stripLegacyTaskContract } from './formatter.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 beforeEach(() => {
@@ -232,5 +232,25 @@ describe('stripInternalTags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
       'The answer is 42',
     );
+  });
+});
+
+describe('stripStrayToolTags', () => {
+  it('strips a stray trailing closing parameter tag', () => {
+    expect(stripStrayToolTags('LAX when nonstops matter enough to drive.</parameter>')).toBe(
+      'LAX when nonstops matter enough to drive.',
+    );
+  });
+
+  it('strips stray invoke and function_calls tags with attributes', () => {
+    expect(
+      stripStrayToolTags('hello<invoke name="send_message"><parameter name="text">world</parameter></invoke>'),
+    ).toBe('helloworld');
+    expect(stripStrayToolTags('<function_calls>hello</function_calls>')).toBe('hello');
+  });
+
+  it('strips antml:-prefixed variants', () => {
+    const closingTag = '<' + '/antml:parameter>';
+    expect(stripStrayToolTags('hello' + closingTag)).toBe('hello');
   });
 });

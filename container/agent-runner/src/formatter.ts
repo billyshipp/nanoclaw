@@ -302,3 +302,17 @@ function escapeXml(str: string): string {
 export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
+
+// Matches stray tool-call XML syntax (`<invoke>`, `<parameter>`,
+// `<function_calls>`, and their `antml:`-prefixed variants) that occasionally
+// survives into the SDK's aggregated final text — e.g. a truncated or
+// misclassified tool_use block. These tags never belong in user-facing text,
+// so they're removed unconditionally rather than only when well-balanced.
+const STRAY_TOOL_TAG_RE = /<\/?(?:antml:)?(?:invoke|parameter|function_calls)(?:\s[^>]*)?>/gi;
+
+/**
+ * Strip stray tool-call XML fragments before delivering agent text to a user.
+ */
+export function stripStrayToolTags(text: string): string {
+  return text.replace(STRAY_TOOL_TAG_RE, '').trim();
+}

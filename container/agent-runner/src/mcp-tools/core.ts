@@ -13,6 +13,7 @@ import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { stripStrayToolTags } from '../formatter.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -85,7 +86,7 @@ export const sendMessage: McpToolDefinition = {
   },
   async handler(args) {
     const to = args.to as string;
-    const text = args.text as string;
+    const text = stripStrayToolTags((args.text as string) || '');
     if (!to) return err(`to is required. Options: ${destinationList()}`);
     if (!text) return err('text is required');
 
@@ -149,7 +150,7 @@ export const sendFile: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+      content: JSON.stringify({ text: stripStrayToolTags((args.text as string) || ''), files: [filename] }),
     });
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
@@ -172,7 +173,7 @@ export const editMessage: McpToolDefinition = {
   },
   async handler(args) {
     const seq = Number(args.messageId);
-    const text = args.text as string;
+    const text = stripStrayToolTags((args.text as string) || '');
     if (!seq || !text) return err('messageId and text are required');
 
     const platformId = getMessageIdBySeq(seq);
