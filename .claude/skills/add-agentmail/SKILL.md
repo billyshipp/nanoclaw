@@ -1,6 +1,6 @@
 ---
 name: add-agentmail
-description: Add AgentMail (email) channel integration — a fully-managed agent inbox via API, no DNS/MX ownership required.
+description: Add AgentMail (email) channel integration — a fully-managed agent inbox via API, no DNS/MX ownership and no public webhook endpoint required.
 ---
 
 # Add AgentMail Email Channel
@@ -14,8 +14,13 @@ provider on your domain.
 NanoClaw doesn't ship channels in trunk — this skill copies the AgentMail
 adapter in from the `channels` branch. There is no official Chat SDK adapter
 for AgentMail, so this is a **native** adapter (like DeltaChat, WhatsApp,
-Signal): it talks to the `agentmail` SDK directly and registers its own raw
-webhook route.
+Signal): it talks to the `agentmail` SDK directly.
+
+**Polling, not webhooks.** AgentMail supports both, but a webhook needs a
+public HTTPS endpoint reachable from AgentMail's servers — infrastructure not
+every install has. This adapter polls instead: no public endpoint, no DNS, no
+tunnel. The tradeoff is latency (new mail arrives on the poll interval, not
+instantly) and a small periodic API call even when nothing's happening.
 
 ## Apply
 
@@ -40,24 +45,23 @@ is already present):
 import './agentmail.js';
 ```
 
-### 3. Install the adapter's dependencies
+### 3. Install the adapter's dependency
 
-Pinned to exact versions — the supply-chain policy rejects ranges and
+Pinned to an exact version — the supply-chain policy rejects ranges and
 `latest`:
 
 ```bash
-pnpm add agentmail@0.5.23 svix@2.3.0
+pnpm add agentmail@0.5.23
 ```
 
-`agentmail` is AgentMail's own Node SDK (inbox, message, and webhook
-management). `svix` verifies inbound webhook signatures — AgentMail delivers
-webhooks via Svix and hands you a per-webhook secret to verify against.
+`agentmail` is AgentMail's own Node SDK (inbox and message management, used
+here for both polling and sending).
 
 ### 4. Build and validate
 
 Build guards the adapter's typed use of the `agentmail` SDK; the registration
-test proves both dependencies are actually installed (the adapter imports
-both — if either is missing, the barrel throws on import).
+test proves the dependency is actually installed (the adapter imports it — if
+missing, the barrel throws on import).
 
 ```bash
 pnpm run build
@@ -66,14 +70,14 @@ pnpm exec vitest run src/channels/agentmail-registration.test.ts
 
 `agentmail-registration.test.ts` imports the real channel barrel and asserts
 the registry contains `agentmail`. It goes red if the import line is deleted
-or drifts, if the barrel fails to evaluate, or if either `agentmail` or
-`svix` isn't installed (the import throws).
+or drifts, if the barrel fails to evaluate, or if `agentmail` isn't installed
+(the import throws).
 
 ## Credentials
 
-Inbox and webhook setup is human and interactive — these steps are prose, not
-a script. A recipe rebuild produces a compiling, registered adapter that
-cannot receive a message until they're done.
+Inbox setup is human and interactive — these steps are prose, not a script. A
+recipe rebuild produces a compiling, registered adapter that cannot send or
+receive a message until they're done.
 
 1. Go to [agentmail.to](https://www.agentmail.to) and create an account.
 2. In the dashboard, go to **Inboxes** → **+ Create Inbox**. On the free plan
@@ -82,23 +86,20 @@ cannot receive a message until they're done.
    **Inbox ID**.
 3. Go to **API Keys** → **Create New API Key**. Copy it immediately — it is
    shown only once.
-4. Go to **Webhooks** → **Create Webhook**:
-   - URL: `https://your-domain/webhook/agentmail`
-   - Event types: `message.received`
-   - Copy the webhook's **secret** (used for Svix signature verification).
+
+No webhook to set up — polling only needs the API key and inbox ID.
 
 ### Store the credentials
 
 ```bash
-# Ensure .env has these three (set-if-absent — never overwrite a value you've already filled in)
+# Ensure .env has these (set-if-absent — never overwrite a value you've already filled in)
 grep -q '^AGENTMAIL_API_KEY=' .env || echo 'AGENTMAIL_API_KEY=<paste API key>' >> .env
 grep -q '^AGENTMAIL_INBOX_ID=' .env || echo 'AGENTMAIL_INBOX_ID=<paste inbox id>' >> .env
-grep -q '^AGENTMAIL_WEBHOOK_SECRET=' .env || echo 'AGENTMAIL_WEBHOOK_SECRET=<paste webhook secret>' >> .env
+# Optional — poll interval in ms, default 30000 (30s) if omitted:
+grep -q '^AGENTMAIL_POLL_INTERVAL_MS=' .env || echo 'AGENTMAIL_POLL_INTERVAL_MS=30000' >> .env
 ```
 
-Rebuild the container image if any group needs it, then restart the service so
-it picks up the new `.env` values and the registered `agentmail` webhook
-route:
+Restart the service so it picks up the new `.env` values and starts polling:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
@@ -123,7 +124,8 @@ ncl messaging-groups send --channel-type agentmail --platform-id agentmail:<your
 
 The last command injects a synthetic inbound message to wake the agent, which
 then composes and sends the real first email via `messages.send`. Reply to
-that email to keep the conversation going.
+that email to keep the conversation going — your reply is picked up on the
+next poll tick (up to `AGENTMAIL_POLL_INTERVAL_MS` later).
 
 Consider granting a role scoped to one agent group instead of a global
 `owner`, per your own risk tolerance — see `ncl roles help grant`.
@@ -145,14 +147,15 @@ approval card fires.)
   is a separate conversation, keyed by *their* address.
 - **how-to-find-id**: the platform ID is the **correspondent's** email
   address, prefixed — `agentmail:<their-address>` — **not** the inbox's own
-  address. The adapter derives it from the webhook's `message.from` field.
+  address. The adapter derives it from the polled message's `from` field.
 - **supports-threads**: no — every email from one correspondent (regardless
   of subject) lands in the same NanoClaw session, matching the Resend
   adapter's model. AgentMail's own thread/message IDs are still used
   internally so replies land in the correct email thread from the
   correspondent's point of view.
 - **typical-use**: async communication — email conversations with longer
-  response expectations.
+  response expectations; polling adds up to one interval of extra latency on
+  top of that.
 - **default-isolation**: same agent group if you want your agent to handle
   email alongside other channels. Separate agent group if email contains
   sensitive correspondence that shouldn't be accessible from other channels.
@@ -163,20 +166,14 @@ approval card fires.)
 **API Keys** page and is shown only once at creation — if in doubt, create a
 new one and update `AGENTMAIL_API_KEY` in `.env`.
 
-**Webhook signature verification fails (every inbound email is dropped with a
-`401`).** `AGENTMAIL_WEBHOOK_SECRET` must match the secret shown for the
-*specific* webhook pointed at `/webhook/agentmail` — each webhook has its own
-secret. Re-copy it from the dashboard's **Webhooks** page if in doubt.
-
-**Replies never reach the agent.** Confirm the webhook in the dashboard is
-enabled, points at your public host's `/webhook/agentmail` (shared webhook
-server, port 3000), and has `message.received` selected. The dashboard's
-webhook page lists recent delivery attempts — a run of failures usually means
-the URL is unreachable from AgentMail's servers (check firewall/reverse proxy
-in front of port 3000).
+**Replies never arrive, or arrive very late.** Confirm the service actually
+restarted after `.env` was updated (check the log line `AgentMail: adapter
+ready, polling started`). Otherwise it's most likely just poll latency —
+lower `AGENTMAIL_POLL_INTERVAL_MS` if the default 30s is too slow, at the cost
+of more frequent API calls.
 
 **Adapter installed but nothing flows.** Run `pnpm exec vitest run
 src/channels/agentmail-registration.test.ts` — red means the barrel import or
-one of the two package installs (`agentmail`, `svix`) drifted, so re-run the
-Apply steps. If green, restart the service so it loads the adapter and
-`.env`, then re-send the hello.
+the `agentmail` package install drifted, so re-run the Apply steps. If green,
+restart the service so it loads the adapter and `.env`, then re-send the
+hello.

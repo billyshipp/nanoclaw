@@ -20,12 +20,12 @@ rm -f src/channels/agentmail.ts src/channels/agentmail-registration.test.ts
 ## 2. Remove credentials
 
 Remove `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`, and
-`AGENTMAIL_WEBHOOK_SECRET` from `.env`.
+`AGENTMAIL_POLL_INTERVAL_MS` (if set) from `.env`.
 
-## 3. Remove the packages
+## 3. Remove the package
 
 ```bash
-pnpm uninstall agentmail svix
+pnpm uninstall agentmail
 ```
 
 ## 4. Rebuild and restart
