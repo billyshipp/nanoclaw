@@ -14,23 +14,35 @@
  * as reply within one (`messages.reply`), so there is no cold-start
  * limitation — the bot can email a correspondent first.
  *
+ * Polling runs on a cron schedule (default: 4am/10am/4pm/10pm daily, install
+ * timezone), not a fixed interval — reuses the same `cron-parser` dependency
+ * already used for scheduled tasks (src/modules/scheduling/recurrence.ts) and
+ * the resolved install timezone (TIMEZONE, src/config.ts). A self-rescheduling
+ * setTimeout chain (compute next occurrence, sleep, poll, repeat) rather than
+ * setInterval, since the gaps between occurrences aren't uniform (4am→10am is
+ * 6h, but the schedule itself is arbitrary cron, not always evenly spaced).
+ *
  * Required env vars (.env): AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID
- * Optional env vars (.env): AGENTMAIL_POLL_INTERVAL_MS (default: 30000)
+ * Optional env vars (.env): AGENTMAIL_POLL_SCHEDULE (cron expression,
+ *                           default: "0 4,10,16,22 * * *")
  */
+import { CronExpressionParser } from 'cron-parser';
+
 import { AgentMailClient } from 'agentmail';
 
+import { TIMEZONE } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const REQUIRED_ENV = ['AGENTMAIL_API_KEY', 'AGENTMAIL_INBOX_ID'] as const;
-const OPTIONAL_ENV = ['AGENTMAIL_POLL_INTERVAL_MS'] as const;
+const OPTIONAL_ENV = ['AGENTMAIL_POLL_SCHEDULE'] as const;
 type AgentMailEnv = { [K in (typeof REQUIRED_ENV)[number]]: string } & {
   [K in (typeof OPTIONAL_ENV)[number]]?: string;
 };
 
-const DEFAULT_POLL_INTERVAL_MS = 30_000;
+const DEFAULT_POLL_SCHEDULE = '0 4,10,16,22 * * *';
 // Safety-net dedup across poll ticks — boundary messages at the exact
 // `after` cutoff could otherwise be delivered twice. Bounded so it never
 // grows unbounded over a long-running process.
@@ -46,9 +58,7 @@ function extractAddress(from: string): string | null {
 function createAdapter(env: AgentMailEnv): ChannelAdapter {
   const client = new AgentMailClient({ apiKey: env.AGENTMAIL_API_KEY });
   const inboxId = env.AGENTMAIL_INBOX_ID;
-  const pollIntervalMs = env.AGENTMAIL_POLL_INTERVAL_MS
-    ? parseInt(env.AGENTMAIL_POLL_INTERVAL_MS, 10)
-    : DEFAULT_POLL_INTERVAL_MS;
+  const pollSchedule = env.AGENTMAIL_POLL_SCHEDULE || DEFAULT_POLL_SCHEDULE;
 
   // Reply-vs-cold-send state: the last inbound message id per correspondent,
   // so a reply threads properly via AgentMail's own In-Reply-To handling.
@@ -57,9 +67,25 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
   const lastInboundMessageId = new Map<string, string>();
   const seenMessageIds = new Set<string>();
   let lastPollTime = new Date();
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let pollTimeout: ReturnType<typeof setTimeout> | null = null;
   let polling = false;
   let connected = false;
+
+  function nextOccurrence(): Date {
+    try {
+      return CronExpressionParser.parse(pollSchedule, { tz: TIMEZONE }).next().toDate();
+    } catch (err) {
+      log.error('AgentMail: invalid AGENTMAIL_POLL_SCHEDULE, falling back to default', { pollSchedule, err });
+      return CronExpressionParser.parse(DEFAULT_POLL_SCHEDULE, { tz: TIMEZONE }).next().toDate();
+    }
+  }
+
+  function scheduleNextPoll(config: ChannelSetup): void {
+    const delayMs = Math.max(0, nextOccurrence().getTime() - Date.now());
+    pollTimeout = setTimeout(() => {
+      void pollOnce(config).finally(() => scheduleNextPoll(config));
+    }, delayMs);
+  }
 
   async function pollOnce(config: ChannelSetup): Promise<void> {
     if (polling) return;
@@ -144,15 +170,17 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
       connected = true;
       lastPollTime = new Date();
 
-      pollTimer = setInterval(() => {
-        void pollOnce(config);
-      }, pollIntervalMs);
+      scheduleNextPoll(config);
 
-      log.info('AgentMail: adapter ready, polling started', { inboxId, pollIntervalMs });
+      log.info('AgentMail: adapter ready, polling scheduled', {
+        inboxId,
+        pollSchedule,
+        nextPollAt: nextOccurrence().toISOString(),
+      });
     },
 
     async teardown(): Promise<void> {
-      if (pollTimer) clearInterval(pollTimer);
+      if (pollTimeout) clearTimeout(pollTimeout);
       connected = false;
     },
 

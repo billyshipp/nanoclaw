@@ -19,8 +19,13 @@ Signal): it talks to the `agentmail` SDK directly.
 **Polling, not webhooks.** AgentMail supports both, but a webhook needs a
 public HTTPS endpoint reachable from AgentMail's servers — infrastructure not
 every install has. This adapter polls instead: no public endpoint, no DNS, no
-tunnel. The tradeoff is latency (new mail arrives on the poll interval, not
-instantly) and a small periodic API call even when nothing's happening.
+tunnel. The tradeoff is latency (new mail arrives on the poll schedule, not
+instantly) and a small periodic API call at each scheduled time.
+
+Polling runs on a cron schedule (default: 4am/10am/4pm/10pm daily, install
+timezone) rather than a fixed interval, reusing the same `cron-parser`
+dependency already used for scheduled tasks — no new dependency to install for
+this part.
 
 ## Apply
 
@@ -87,16 +92,19 @@ receive a message until they're done.
 3. Go to **API Keys** → **Create New API Key**. Copy it immediately — it is
    shown only once.
 
-No webhook to set up — polling only needs the API key and inbox ID.
+No webhook to set up — polling only needs the API key and inbox ID. The inbox
+ID is the inbox's own email address (e.g. `yourbot@agentmail.to`) — there is
+no separate opaque ID to look up. If the dashboard only shows the address,
+that address *is* the inbox ID.
 
 ### Store the credentials
 
 ```bash
 # Ensure .env has these (set-if-absent — never overwrite a value you've already filled in)
 grep -q '^AGENTMAIL_API_KEY=' .env || echo 'AGENTMAIL_API_KEY=<paste API key>' >> .env
-grep -q '^AGENTMAIL_INBOX_ID=' .env || echo 'AGENTMAIL_INBOX_ID=<paste inbox id>' >> .env
-# Optional — poll interval in ms, default 30000 (30s) if omitted:
-grep -q '^AGENTMAIL_POLL_INTERVAL_MS=' .env || echo 'AGENTMAIL_POLL_INTERVAL_MS=30000' >> .env
+grep -q '^AGENTMAIL_INBOX_ID=' .env || echo 'AGENTMAIL_INBOX_ID=<your inbox address>' >> .env
+# Optional — cron expression, install timezone; default is 4am/10am/4pm/10pm daily:
+grep -q '^AGENTMAIL_POLL_SCHEDULE=' .env || echo 'AGENTMAIL_POLL_SCHEDULE=0 4,10,16,22 * * *' >> .env
 ```
 
 Restart the service so it picks up the new `.env` values and starts polling:
@@ -124,8 +132,9 @@ ncl messaging-groups send --channel-type agentmail --platform-id agentmail:<your
 
 The last command injects a synthetic inbound message to wake the agent, which
 then composes and sends the real first email via `messages.send`. Reply to
-that email to keep the conversation going — your reply is picked up on the
-next poll tick (up to `AGENTMAIL_POLL_INTERVAL_MS` later).
+that email to keep the conversation going — your reply is picked up at the
+next scheduled poll (`AGENTMAIL_POLL_SCHEDULE`), which may be several hours
+away on the default schedule.
 
 Consider granting a role scoped to one agent group instead of a global
 `owner`, per your own risk tolerance — see `ncl roles help grant`.
@@ -168,9 +177,10 @@ new one and update `AGENTMAIL_API_KEY` in `.env`.
 
 **Replies never arrive, or arrive very late.** Confirm the service actually
 restarted after `.env` was updated (check the log line `AgentMail: adapter
-ready, polling started`). Otherwise it's most likely just poll latency —
-lower `AGENTMAIL_POLL_INTERVAL_MS` if the default 30s is too slow, at the cost
-of more frequent API calls.
+ready, polling scheduled` — it also logs `nextPollAt`, so you can see exactly
+when the next check happens). Otherwise it's most likely just poll latency —
+add more times to `AGENTMAIL_POLL_SCHEDULE` if the default four-times-a-day
+cadence is too slow, at the cost of more frequent API calls.
 
 **Adapter installed but nothing flows.** Run `pnpm exec vitest run
 src/channels/agentmail-registration.test.ts` — red means the barrel import or

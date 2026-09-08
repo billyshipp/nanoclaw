@@ -20,7 +20,7 @@ rm -f src/channels/agentmail.ts src/channels/agentmail-registration.test.ts
 ## 2. Remove credentials
 
 Remove `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ID`, and
-`AGENTMAIL_POLL_INTERVAL_MS` (if set) from `.env`.
+`AGENTMAIL_POLL_SCHEDULE` (if set) from `.env`.
 
 ## 3. Remove the package
 
