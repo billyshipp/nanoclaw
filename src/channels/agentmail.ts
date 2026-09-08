@@ -5,39 +5,46 @@
  * external correspondent is a separate messaging group, platformId
  * "agentmail:<their-address>" — same flattened model as the Resend adapter,
  * chosen for parity: one NanoClaw session per correspondent, regardless of how
- * many distinct email subject-threads they start.
- *
- * Polling, not webhooks: AgentMail supports both, but a webhook needs a public
- * HTTPS endpoint reachable from AgentMail's servers, which not every install
- * has. Polling needs nothing but outbound API calls. Unlike Resend's adapter,
+ * many distinct email subject-threads they start. Unlike Resend's adapter,
  * AgentMail's SDK can originate a brand-new thread (`messages.send`) as well
  * as reply within one (`messages.reply`), so there is no cold-start
- * limitation — the bot can email a correspondent first.
+ * limitation — the bot can email a correspondent first, in either mode below.
  *
- * Polling runs on a cron schedule (default: 4am/10am/4pm/10pm daily, install
- * timezone), not a fixed interval — reuses the same `cron-parser` dependency
- * already used for scheduled tasks (src/modules/scheduling/recurrence.ts) and
- * the resolved install timezone (TIMEZONE, src/config.ts). A self-rescheduling
- * setTimeout chain (compute next occurrence, sleep, poll, repeat) rather than
- * setInterval, since the gaps between occurrences aren't uniform (4am→10am is
- * 6h, but the schedule itself is arbitrary cron, not always evenly spaced).
+ * Two inbound modes, chosen by AGENTMAIL_MODE (default: polling):
+ *
+ *  - polling: no public endpoint needed. Runs on a cron schedule (default
+ *    4am/10am/4pm/10pm daily, install timezone) rather than a fixed interval
+ *    — reuses the same `cron-parser` dependency already used for scheduled
+ *    tasks (src/modules/scheduling/recurrence.ts) and the resolved install
+ *    timezone (TIMEZONE, src/config.ts). A self-rescheduling setTimeout chain
+ *    (compute next occurrence, sleep, poll, repeat) rather than setInterval,
+ *    since cron occurrences aren't necessarily evenly spaced.
+ *  - webhook: instant delivery, but needs a public HTTPS endpoint reachable
+ *    from AgentMail's servers. Registers a raw route on the shared webhook
+ *    server (registerWebhookHandler) and verifies signatures with `svix`
+ *    (AgentMail delivers webhooks via Svix).
  *
  * Required env vars (.env): AGENTMAIL_API_KEY, AGENTMAIL_INBOX_ID
- * Optional env vars (.env): AGENTMAIL_POLL_SCHEDULE (cron expression,
- *                           default: "0 4,10,16,22 * * *")
+ * Optional env vars (.env): AGENTMAIL_MODE ("polling" | "webhook", default
+ *                           "polling"), AGENTMAIL_POLL_SCHEDULE (cron
+ *                           expression, polling mode only, default
+ *                           "0 4,10,16,22 * * *"), AGENTMAIL_WEBHOOK_SECRET
+ *                           (webhook mode only, required in that mode)
  */
 import { CronExpressionParser } from 'cron-parser';
 
 import { AgentMailClient } from 'agentmail';
+import { Webhook as SvixWebhook } from 'svix';
 
 import { TIMEZONE } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { registerWebhookHandler } from '../webhook-server.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const REQUIRED_ENV = ['AGENTMAIL_API_KEY', 'AGENTMAIL_INBOX_ID'] as const;
-const OPTIONAL_ENV = ['AGENTMAIL_POLL_SCHEDULE'] as const;
+const OPTIONAL_ENV = ['AGENTMAIL_MODE', 'AGENTMAIL_POLL_SCHEDULE', 'AGENTMAIL_WEBHOOK_SECRET'] as const;
 type AgentMailEnv = { [K in (typeof REQUIRED_ENV)[number]]: string } & {
   [K in (typeof OPTIONAL_ENV)[number]]?: string;
 };
@@ -55,9 +62,26 @@ function extractAddress(from: string): string | null {
   return addr.includes('@') ? addr : null;
 }
 
+interface WireMessage {
+  message_id: string;
+  thread_id: string;
+  from: string;
+  subject?: string | null;
+  text?: string | null;
+  extracted_text?: string | null;
+}
+
+interface WireEvent {
+  type: 'event';
+  event_type: string;
+  event_id: string;
+  message?: WireMessage;
+}
+
 function createAdapter(env: AgentMailEnv): ChannelAdapter {
   const client = new AgentMailClient({ apiKey: env.AGENTMAIL_API_KEY });
   const inboxId = env.AGENTMAIL_INBOX_ID;
+  const mode = env.AGENTMAIL_MODE === 'webhook' ? 'webhook' : 'polling';
   const pollSchedule = env.AGENTMAIL_POLL_SCHEDULE || DEFAULT_POLL_SCHEDULE;
 
   // Reply-vs-cold-send state: the last inbound message id per correspondent,
@@ -65,11 +89,13 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
   // In-memory only — a host restart falls back to a cold send for that
   // correspondent's next reply, same tradeoff as Resend's ThreadResolver.
   const lastInboundMessageId = new Map<string, string>();
+  let connected = false;
+
+  // --- polling mode state ---
   const seenMessageIds = new Set<string>();
   let lastPollTime = new Date();
   let pollTimeout: ReturnType<typeof setTimeout> | null = null;
   let polling = false;
-  let connected = false;
 
   function nextOccurrence(): Date {
     try {
@@ -87,17 +113,35 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
     }, delayMs);
   }
 
+  async function deliverInbound(config: ChannelSetup, messageId: string, from: string, text: string): Promise<void> {
+    const address = extractAddress(from);
+    if (!address) {
+      log.warn('AgentMail: could not extract sender address', { from });
+      return;
+    }
+    const platformId = `agentmail:${address}`;
+    lastInboundMessageId.set(platformId, messageId);
+    try {
+      await config.onInbound(platformId, null, {
+        id: messageId,
+        kind: 'chat',
+        content: { text, sender: address, senderId: address },
+        timestamp: new Date().toISOString(),
+        isGroup: false,
+        isMention: true,
+      });
+    } catch (err) {
+      log.error('AgentMail: error handling incoming message', { err, messageId });
+    }
+  }
+
   async function pollOnce(config: ChannelSetup): Promise<void> {
     if (polling) return;
     polling = true;
     try {
       const since = lastPollTime;
       let pageToken: string | undefined;
-      const items: Array<{
-        messageId: string;
-        from: string;
-        createdAt: Date;
-      }> = [];
+      const items: Array<{ messageId: string; from: string; createdAt: Date }> = [];
 
       do {
         const res = await client.inboxes.messages.list(inboxId, {
@@ -122,32 +166,8 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
           if (oldest !== undefined) seenMessageIds.delete(oldest);
         }
 
-        const address = extractAddress(item.from);
-        if (!address) {
-          log.warn('AgentMail: could not extract sender address', { from: item.from });
-          continue;
-        }
-
-        const platformId = `agentmail:${address}`;
-        lastInboundMessageId.set(platformId, item.messageId);
-
-        try {
-          const full = await client.inboxes.messages.get(inboxId, item.messageId);
-          await config.onInbound(platformId, null, {
-            id: item.messageId,
-            kind: 'chat',
-            content: {
-              text: full.text || full.extractedText || '',
-              sender: address,
-              senderId: address,
-            },
-            timestamp: item.createdAt.toISOString(),
-            isGroup: false,
-            isMention: true,
-          });
-        } catch (err) {
-          log.error('AgentMail: error handling incoming message', { err, messageId: item.messageId });
-        }
+        const full = await client.inboxes.messages.get(inboxId, item.messageId);
+        await deliverInbound(config, item.messageId, item.from, full.text || full.extractedText || '');
       }
 
       lastPollTime = items[items.length - 1].createdAt;
@@ -158,6 +178,47 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
     }
   }
 
+  function setupWebhook(config: ChannelSetup): void {
+    const verifier = new SvixWebhook(env.AGENTMAIL_WEBHOOK_SECRET as string);
+
+    registerWebhookHandler('agentmail', async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      const payload = Buffer.concat(chunks).toString('utf-8');
+
+      const svixId = req.headers['svix-id'];
+      const svixTimestamp = req.headers['svix-timestamp'];
+      const svixSignature = req.headers['svix-signature'];
+      try {
+        verifier.verify(payload, {
+          'svix-id': Array.isArray(svixId) ? svixId[0] : (svixId ?? ''),
+          'svix-timestamp': Array.isArray(svixTimestamp) ? svixTimestamp[0] : (svixTimestamp ?? ''),
+          'svix-signature': Array.isArray(svixSignature) ? svixSignature[0] : (svixSignature ?? ''),
+        });
+      } catch (err) {
+        log.warn('AgentMail: webhook signature verification failed', { err });
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('invalid signature');
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+
+      let event: WireEvent;
+      try {
+        event = JSON.parse(payload);
+      } catch (err) {
+        log.error('AgentMail: unparseable webhook payload', { err });
+        return;
+      }
+
+      if (event.event_type !== 'message.received' || !event.message) return;
+      const msg = event.message;
+      await deliverInbound(config, msg.message_id, msg.from, msg.text || msg.extracted_text || '');
+    });
+  }
+
   return {
     name: 'agentmail',
     channelType: 'agentmail',
@@ -165,18 +226,22 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
     defaults: AGENTMAIL_DEFAULTS,
 
     async setup(config: ChannelSetup): Promise<void> {
-      // Fail fast on bad credentials / unknown inbox before starting the poll loop.
+      // Fail fast on bad credentials / unknown inbox before starting either mode.
       await client.inboxes.get(inboxId);
       connected = true;
-      lastPollTime = new Date();
 
-      scheduleNextPoll(config);
-
-      log.info('AgentMail: adapter ready, polling scheduled', {
-        inboxId,
-        pollSchedule,
-        nextPollAt: nextOccurrence().toISOString(),
-      });
+      if (mode === 'webhook') {
+        setupWebhook(config);
+        log.info('AgentMail: adapter ready (webhook mode)', { inboxId });
+      } else {
+        lastPollTime = new Date();
+        scheduleNextPoll(config);
+        log.info('AgentMail: adapter ready (polling mode)', {
+          inboxId,
+          pollSchedule,
+          nextPollAt: nextOccurrence().toISOString(),
+        });
+      }
     },
 
     async teardown(): Promise<void> {
@@ -231,6 +296,7 @@ registerChannelAdapter('agentmail', {
   factory: () => {
     const env = readEnvFile([...REQUIRED_ENV, ...OPTIONAL_ENV]);
     if (!env.AGENTMAIL_API_KEY || !env.AGENTMAIL_INBOX_ID) return null;
+    if (env.AGENTMAIL_MODE === 'webhook' && !env.AGENTMAIL_WEBHOOK_SECRET) return null;
     return createAdapter(env as AgentMailEnv);
   },
   defaults: AGENTMAIL_DEFAULTS,

@@ -1,6 +1,6 @@
 ---
 name: add-agentmail
-description: Add AgentMail (email) channel integration — a fully-managed agent inbox via API, no DNS/MX ownership and no public webhook endpoint required.
+description: Add AgentMail (email) channel integration — a fully-managed agent inbox via API. Choose polling (no public endpoint needed) or webhook (instant delivery) at install time.
 ---
 
 # Add AgentMail Email Channel
@@ -16,16 +16,35 @@ adapter in from the `channels` branch. There is no official Chat SDK adapter
 for AgentMail, so this is a **native** adapter (like DeltaChat, WhatsApp,
 Signal): it talks to the `agentmail` SDK directly.
 
-**Polling, not webhooks.** AgentMail supports both, but a webhook needs a
-public HTTPS endpoint reachable from AgentMail's servers — infrastructure not
-every install has. This adapter polls instead: no public endpoint, no DNS, no
-tunnel. The tradeoff is latency (new mail arrives on the poll schedule, not
-instantly) and a small periodic API call at each scheduled time.
+## Choose a mode
 
-Polling runs on a cron schedule (default: 4am/10am/4pm/10pm daily, install
-timezone) rather than a fixed interval, reusing the same `cron-parser`
-dependency already used for scheduled tasks — no new dependency to install for
-this part.
+AgentMail supports both webhooks and polling for inbound mail. Ask the user
+which one fits their install, before touching credentials:
+
+- **Polling (recommended, default)** — no public endpoint, no DNS, nothing to
+  expose. Checks for new mail on a schedule instead of instantly. Pick this
+  unless the install already has a public HTTPS endpoint reachable from the
+  internet.
+- **Webhook** — instant delivery, but requires a public HTTPS endpoint
+  reachable from AgentMail's servers (a reverse proxy, tunnel, or public
+  domain pointed at this host's port 3000). Pick this only if that already
+  exists.
+
+If polling, also ask **how often to check** — offer common presets and
+convert to the underlying cron expression (`AGENTMAIL_POLL_SCHEDULE`, install
+timezone):
+
+| User choice | Cron expression |
+|---|---|
+| Every 5 minutes | `*/5 * * * *` |
+| Every 15 minutes | `*/15 * * * *` |
+| Every 30 minutes | `*/30 * * * *` |
+| Hourly | `0 * * * *` |
+| Four times a day (4am/10am/4pm/10pm) — **default** | `0 4,10,16,22 * * *` |
+| Custom | ask for a raw cron expression |
+
+More frequent polling means faster replies but more periodic API calls —
+there's no wrong answer, just a latency/traffic tradeoff.
 
 ## Apply
 
@@ -50,23 +69,25 @@ is already present):
 import './agentmail.js';
 ```
 
-### 3. Install the adapter's dependency
+### 3. Install the adapter's dependencies
 
-Pinned to an exact version — the supply-chain policy rejects ranges and
+Pinned to exact versions — the supply-chain policy rejects ranges and
 `latest`:
 
 ```bash
-pnpm add agentmail@0.5.23
+pnpm add agentmail@0.5.23 svix@2.3.0
 ```
 
 `agentmail` is AgentMail's own Node SDK (inbox and message management, used
-here for both polling and sending).
+for both modes and for sending). `svix` verifies inbound webhook signatures —
+only exercised in webhook mode, but always installed so switching modes later
+never requires a fresh `pnpm add`.
 
 ### 4. Build and validate
 
-Build guards the adapter's typed use of the `agentmail` SDK; the registration
-test proves the dependency is actually installed (the adapter imports it — if
-missing, the barrel throws on import).
+Build guards the adapter's typed use of both SDKs; the registration test
+proves both dependencies are actually installed (the adapter imports both —
+if either is missing, the barrel throws on import).
 
 ```bash
 pnpm run build
@@ -75,8 +96,8 @@ pnpm exec vitest run src/channels/agentmail-registration.test.ts
 
 `agentmail-registration.test.ts` imports the real channel barrel and asserts
 the registry contains `agentmail`. It goes red if the import line is deleted
-or drifts, if the barrel fails to evaluate, or if `agentmail` isn't installed
-(the import throws).
+or drifts, if the barrel fails to evaluate, or if either package isn't
+installed (the import throws).
 
 ## Credentials
 
@@ -87,15 +108,15 @@ receive a message until they're done.
 1. Go to [agentmail.to](https://www.agentmail.to) and create an account.
 2. In the dashboard, go to **Inboxes** → **+ Create Inbox**. On the free plan
    the domain defaults to `agentmail.to` (e.g. `yourbot@agentmail.to`); pick a
-   username, or bring a verified custom domain if you have one. Copy the
-   **Inbox ID**.
+   username, or bring a verified custom domain if you have one. The inbox's
+   own email address **is** its Inbox ID — there's no separate opaque ID to
+   look up.
 3. Go to **API Keys** → **Create New API Key**. Copy it immediately — it is
    shown only once.
-
-No webhook to set up — polling only needs the API key and inbox ID. The inbox
-ID is the inbox's own email address (e.g. `yourbot@agentmail.to`) — there is
-no separate opaque ID to look up. If the dashboard only shows the address,
-that address *is* the inbox ID.
+4. **Webhook mode only** — go to **Webhooks** → **Create Webhook**:
+   - URL: `https://your-domain/webhook/agentmail`
+   - Event types: `message.received`
+   - Copy the webhook's **secret** (used for Svix signature verification).
 
 ### Store the credentials
 
@@ -103,38 +124,68 @@ that address *is* the inbox ID.
 # Ensure .env has these (set-if-absent — never overwrite a value you've already filled in)
 grep -q '^AGENTMAIL_API_KEY=' .env || echo 'AGENTMAIL_API_KEY=<paste API key>' >> .env
 grep -q '^AGENTMAIL_INBOX_ID=' .env || echo 'AGENTMAIL_INBOX_ID=<your inbox address>' >> .env
-# Optional — cron expression, install timezone; default is 4am/10am/4pm/10pm daily:
-grep -q '^AGENTMAIL_POLL_SCHEDULE=' .env || echo 'AGENTMAIL_POLL_SCHEDULE=0 4,10,16,22 * * *' >> .env
 ```
 
-Restart the service so it picks up the new `.env` values and starts polling:
+**Polling mode** (default — omit `AGENTMAIL_MODE` entirely, or set it explicitly):
+
+```bash
+grep -q '^AGENTMAIL_MODE=' .env || echo 'AGENTMAIL_MODE=polling' >> .env
+# Cron expression from the "Choose a mode" table above:
+grep -q '^AGENTMAIL_POLL_SCHEDULE=' .env || echo 'AGENTMAIL_POLL_SCHEDULE=<chosen cron expression>' >> .env
+```
+
+**Webhook mode**:
+
+```bash
+grep -q '^AGENTMAIL_MODE=' .env || echo 'AGENTMAIL_MODE=webhook' >> .env
+grep -q '^AGENTMAIL_WEBHOOK_SECRET=' .env || echo 'AGENTMAIL_WEBHOOK_SECRET=<paste webhook secret>' >> .env
+```
+
+Restart the service so it picks up the new `.env` values:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
 # systemctl --user restart nanoclaw                # Linux
 ```
 
+Confirm the mode actually started as intended — the log line differs per
+mode: `AgentMail: adapter ready (polling mode)` (with `pollSchedule` and
+`nextPollAt`) or `AgentMail: adapter ready (webhook mode)`.
+
 ## Connect yourself
 
 Because AgentMail can originate a new thread (unlike a Resend-style adapter,
 which can only reply within a thread it received), the bot really can write
-to you first. Wire your own address as owner and have it email you a hello.
-Tell it your address and which agent should answer your email (`ncl groups
-list` shows their folders):
+to you first. Wire your own address as owner and trigger its welcome
+behavior. Tell it your address and which agent should answer your email
+(`ncl groups list` shows their folders):
 
 ```bash
 ncl users create --id agentmail:<your-address> --kind agentmail --display-name Owner
 ncl roles grant --user agentmail:<your-address> --role owner
 ncl messaging-groups create --channel-type agentmail --platform-id agentmail:<your-address> --is-group 0
 ncl wirings create --channel-type agentmail --platform-id agentmail:<your-address> --agent-group <agent-folder> --engage-mode pattern --engage-pattern .
-ncl messaging-groups send --channel-type agentmail --platform-id agentmail:<your-address> --sender-id agentmail:<your-address> --sender Owner --text "Hi — I'm your NanoClaw assistant, reachable by email now. Reply to this thread anytime."
+ncl messaging-groups send --channel-type agentmail --platform-id agentmail:<your-address> --sender-id agentmail:<your-address> --sender Owner --text "This email channel was just connected. Follow the welcome skill exactly: introduce yourself and confirm email works by sending me a short welcome email now, then reply to any follow-up in this same thread."
 ```
 
-The last command injects a synthetic inbound message to wake the agent, which
-then composes and sends the real first email via `messages.send`. Reply to
-that email to keep the conversation going — your reply is picked up at the
-next scheduled poll (`AGENTMAIL_POLL_SCHEDULE`), which may be several hours
-away on the default schedule.
+**Why the `--text` reads as a third-person instruction, not a greeting to
+relay verbatim:** `ncl messaging-groups send` (see `ncl messaging-groups help
+send`) injects its `--text` as an *inbound* message — the agent receives it as
+something someone said to it, not as a script to read aloud. Phrasing it as
+the literal greeting ("Hi, I'm your assistant...") backfires: the agent reads
+that as the owner narrating in the bot's own voice, treats it as a passive FYI
+about the channel, and never actually sends anything. Every other channel's
+first-contact trigger in this codebase uses the same third-person-event +
+explicit-instruction shape (see `src/channels/telegram.ts`'s own connect
+message: *"This Telegram group was just connected. Follow the welcome skill
+exactly..."*) — mirror that shape for any channel's hello step, don't write
+the greeting text directly into `--text`.
+
+The command wakes the agent, which composes and sends the real welcome email
+via `messages.send`. Reply to that email to keep the conversation going — in
+polling mode, your reply is picked up at the next scheduled poll (which may
+be hours away on the default four-times-a-day schedule); in webhook mode, it
+arrives instantly.
 
 Consider granting a role scoped to one agent group instead of a global
 `owner`, per your own risk tolerance — see `ncl roles help grant`.
@@ -156,15 +207,16 @@ approval card fires.)
   is a separate conversation, keyed by *their* address.
 - **how-to-find-id**: the platform ID is the **correspondent's** email
   address, prefixed — `agentmail:<their-address>` — **not** the inbox's own
-  address. The adapter derives it from the polled message's `from` field.
+  address. The adapter derives it from the sender's `from` field, whichever
+  mode delivered it.
 - **supports-threads**: no — every email from one correspondent (regardless
   of subject) lands in the same NanoClaw session, matching the Resend
   adapter's model. AgentMail's own thread/message IDs are still used
   internally so replies land in the correct email thread from the
   correspondent's point of view.
 - **typical-use**: async communication — email conversations with longer
-  response expectations; polling adds up to one interval of extra latency on
-  top of that.
+  response expectations; polling mode adds up to one poll interval of extra
+  latency on top of that.
 - **default-isolation**: same agent group if you want your agent to handle
   email alongside other channels. Separate agent group if email contains
   sensitive correspondence that shouldn't be accessible from other channels.
@@ -175,15 +227,27 @@ approval card fires.)
 **API Keys** page and is shown only once at creation — if in doubt, create a
 new one and update `AGENTMAIL_API_KEY` in `.env`.
 
-**Replies never arrive, or arrive very late.** Confirm the service actually
-restarted after `.env` was updated (check the log line `AgentMail: adapter
-ready, polling scheduled` — it also logs `nextPollAt`, so you can see exactly
-when the next check happens). Otherwise it's most likely just poll latency —
-add more times to `AGENTMAIL_POLL_SCHEDULE` if the default four-times-a-day
-cadence is too slow, at the cost of more frequent API calls.
+**Replies never arrive, or arrive very late (polling mode).** Confirm the
+service actually restarted after `.env` was updated (check for the log line
+`AgentMail: adapter ready (polling mode)` — it also logs `nextPollAt`, so you
+can see exactly when the next check happens). Otherwise it's just poll
+latency — tighten `AGENTMAIL_POLL_SCHEDULE` if the chosen cadence is too slow,
+at the cost of more frequent API calls.
+
+**Webhook signature verification fails (every inbound email is dropped with a
+`401`), webhook mode.** `AGENTMAIL_WEBHOOK_SECRET` must match the secret shown
+for the *specific* webhook pointed at `/webhook/agentmail` — each webhook has
+its own secret. Re-copy it from the dashboard's **Webhooks** page if in doubt.
+
+**Replies never reach the agent, webhook mode.** Confirm the webhook in the
+dashboard is enabled, points at your public host's `/webhook/agentmail`
+(shared webhook server, port 3000), and has `message.received` selected. The
+dashboard's webhook page lists recent delivery attempts — a run of failures
+usually means the URL is unreachable from AgentMail's servers (check
+firewall/reverse proxy in front of port 3000).
 
 **Adapter installed but nothing flows.** Run `pnpm exec vitest run
 src/channels/agentmail-registration.test.ts` — red means the barrel import or
-the `agentmail` package install drifted, so re-run the Apply steps. If green,
-restart the service so it loads the adapter and `.env`, then re-send the
-hello.
+one of the two package installs (`agentmail`, `svix`) drifted, so re-run the
+Apply steps. If green, restart the service so it loads the adapter and
+`.env`, then re-send the hello.
