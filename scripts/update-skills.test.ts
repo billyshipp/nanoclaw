@@ -50,6 +50,20 @@ describe('installed skill detection', () => {
       { name: 'slack', skillName: 'add-slack', kind: 'channel' },
     ]);
   });
+
+  it('attributes barrel lines appended by another skill to that skill', () => {
+    const root = temp('nanoclaw-skills-owned-');
+    write(root, 'src/channels/index.ts', "import './cli.js';\nimport './slack.js';\nimport './slack-guard.js';\n");
+    write(
+      root,
+      '.claude/skills/add-slack/SKILL.md',
+      ['```nc:append to:src/channels/index.ts', "import './slack.js';", '```'].join('\n') +
+        '\n' +
+        ['```nc:append to:src/channels/index.ts', "import './slack-guard.js';", '```'].join('\n'),
+    );
+
+    expect(detectInstalledSkills(root)).toEqual([{ name: 'slack', skillName: 'add-slack', kind: 'channel' }]);
+  });
 });
 
 describe('registry refresh end to end', () => {
@@ -128,6 +142,30 @@ describe('registry refresh end to end', () => {
     expect(report.remotes).toEqual({ channels: 'upstream' });
     expect(report.skills).toMatchObject([{ name: 'demo', status: 'refreshed' }]);
     expect(fs.readFileSync(path.join(install, 'src/channels/demo.ts'), 'utf8')).toContain('upstream-current');
+  });
+
+  it('skips a prose-only channel that the channels registry does not carry', async () => {
+    const seed = temp('nanoclaw-skills-local-seed-');
+    run(seed, 'git', ['init', '-b', 'main']);
+    write(seed, 'src/channels/index.ts', "import './cli.js';\n");
+    commit(seed, 'main');
+    run(seed, 'git', ['checkout', '-b', 'channels']);
+    write(seed, 'src/channels/other.ts', 'export {};\n');
+    commit(seed, 'registry');
+    run(seed, 'git', ['checkout', 'main']);
+
+    const install = temp('nanoclaw-skills-local-install-');
+    fs.rmSync(install, { recursive: true });
+    run(path.dirname(install), 'git', ['clone', seed, install]);
+    write(install, 'src/channels/index.ts', "import './cli.js';\nimport './local.js';\n");
+    write(install, 'src/channels/local.ts', 'export {};\n');
+    write(install, '.claude/skills/add-local/SKILL.md', '# Apply\nLocal channel.\n');
+    commit(install, 'local channel');
+
+    const report = await refreshInstalledSkills(install);
+
+    expect(report.success, JSON.stringify(report, null, 2)).toBe(true);
+    expect(report.skills).toMatchObject([{ name: 'local', status: 'skipped' }]);
   });
 
   it('returns a blocking structured failure for prose-only installed skills', async () => {

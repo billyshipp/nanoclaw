@@ -19,7 +19,7 @@ export interface SkillRefreshResult {
   name: string;
   skillName: string;
   kind: InstalledSkillKind;
-  status: 'refreshed' | 'failed';
+  status: 'refreshed' | 'skipped' | 'failed';
   applied: string[];
   skipped: string[];
   errors: string[];
@@ -84,9 +84,38 @@ function readImports(file: string): string[] {
   return names;
 }
 
+// Barrel lines appended by some skill's `nc:append` directive, keyed by the
+// imported module name → the skill directory that owns the line. A barrel
+// entry with no `add-<name>` skill of its own but owned by another skill (e.g.
+// add-slack's `slack-a2a-guard`, slack-a2a-rooms' `slack-a2a`) is refreshed by
+// that owner, not detected as a separate channel.
+function appendedBarrelOwners(root: string, barrel: string): Map<string, string> {
+  const owners = new Map<string, string>();
+  const skillsDir = path.join(root, '.claude/skills');
+  if (!fs.existsSync(skillsDir)) return owners;
+  const re = /^\s*import\s+['"]\.\/([a-z0-9-]+)\.js['"];?\s*$/;
+  for (const entry of fs.readdirSync(skillsDir)) {
+    const file = path.join(skillsDir, entry, 'SKILL.md');
+    if (!fs.existsSync(file)) continue;
+    for (const d of parseDirectives(fs.readFileSync(file, 'utf8'))) {
+      if (d.kind !== 'append' || d.attrs.to !== barrel) continue;
+      for (const line of d.body) {
+        const match = line.match(re);
+        if (match && !owners.has(match[1])) owners.set(match[1], entry);
+      }
+    }
+  }
+  return owners;
+}
+
 export function detectInstalledSkills(root: string): InstalledSkill[] {
+  const channelOwners = appendedBarrelOwners(root, 'src/channels/index.ts');
   const channels = readImports(path.join(root, 'src/channels/index.ts'))
     .filter((name) => name !== 'cli')
+    .filter((name) => {
+      const owner = channelOwners.get(name);
+      return !owner || owner === `add-${name}`;
+    })
     .map((name) => ({ name, skillName: `add-${name}`, kind: 'channel' as const }));
   const providers = new Set([
     ...readImports(path.join(root, 'src/providers/index.ts')),
@@ -154,6 +183,18 @@ export async function refreshInstalledSkills(
     } else {
       const directives = parseDirectives(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8'));
       if (directives.length === 0) {
+        // A local-only channel (its adapter is not on the registry branch) has
+        // nothing upstream to refresh from; skip it rather than block.
+        if (skill.kind === 'channel' && !registryCarries(root, 'channels', `src/channels/${skill.name}.ts`, remotes)) {
+          results.push({
+            ...skill,
+            status: 'skipped',
+            applied: [],
+            skipped: ['local channel: not on the channels registry branch'],
+            errors: [],
+          });
+          continue;
+        }
         errors.push('Skill has no structured apply directives and cannot be refreshed headlessly');
       }
     }
@@ -203,11 +244,28 @@ export async function refreshInstalledSkills(
   return {
     schema: 'nanoclaw-skill-refresh/v1',
     schemaVersion: 1,
-    success: results.every((result) => result.status === 'refreshed'),
+    success: results.every((result) => result.status !== 'failed'),
     selected: selected.map((skill) => skill.name),
     remotes,
     skills: results,
   };
+}
+
+function registryCarries(root: string, branch: string, file: string, remotes: Record<string, string>): boolean {
+  let remote: string;
+  try {
+    remote = remotes[branch] ?? resolveRegistryRemote(root, branch);
+  } catch {
+    return true; // Unknown registry: fail closed and keep the refresh error.
+  }
+  remotes[branch] = remote;
+  tryGit(root, ['fetch', '--quiet', remote, branch]);
+  try {
+    git(root, ['cat-file', '-e', `${remote}/${branch}:${file}`]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 interface CliArgs {
