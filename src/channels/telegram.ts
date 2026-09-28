@@ -77,6 +77,38 @@ async function fetchBotUsername(token: string): Promise<string | null> {
   }
 }
 
+interface MdNode {
+  type: string;
+  url?: string;
+  children?: MdNode[];
+}
+
+/**
+ * Replace `mailto:` links whose address contains `_` with their text. The
+ * adapter's GFM parser autolinks bare emails and renders them as
+ * `[text](mailto:addr)`; with an `_` in addr (first_last@example.com)
+ * Telegram rejects the whole message ("Can't find end of Italic entity" /
+ * "Can't find end of a URL") and delivery is dropped after retries. As plain
+ * text the address is escaped normally and Telegram clients still linkify it.
+ */
+export function unwrapUnsafeMailtoLinks<T extends MdNode>(node: T): T {
+  if (!node.children) return node;
+  const children = node.children.flatMap((child): MdNode[] =>
+    child.type === 'link' && child.url?.startsWith('mailto:') && child.url.includes('_')
+      ? (child.children ?? []).map(unwrapUnsafeMailtoLinks)
+      : [unwrapUnsafeMailtoLinks(child)],
+  );
+  return { ...node, children };
+}
+
+/** Route the adapter's MarkdownV2 renderer through unwrapUnsafeMailtoLinks. */
+export function patchMailtoRendering(adapter: ReturnType<typeof createTelegramAdapter>): void {
+  // formatConverter is protected in the typings but a plain instance field.
+  const converter = (adapter as unknown as { formatConverter: { fromAst(ast: MdNode): string } }).formatConverter;
+  const fromAst = converter.fromAst.bind(converter);
+  converter.fromAst = (ast) => fromAst(unwrapUnsafeMailtoLinks(ast));
+}
+
 function isGroupPlatformId(platformId: string): boolean {
   // platformId is "telegram:<chatId>". Negative chat IDs are groups/channels.
   const id = platformId.split(':').pop() ?? '';
@@ -379,6 +411,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     botToken: token,
     mode: 'polling',
   });
+  patchMailtoRendering(telegramAdapter);
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
