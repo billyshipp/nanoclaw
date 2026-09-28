@@ -124,6 +124,31 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl && \
     chmod +x /usr/local/bin/ncl
 
+# ---- Python 3.12 + yt-dlp (last30days skill) ---------------------------------
+# Debian 12's python3 is 3.11 and its yt-dlp is years stale, so both come from
+# uv: a managed CPython under /opt linked in as python3, and yt-dlp as a uv tool
+# with its `pin` extra so every transitive dep is pinned too. Consumer:
+# container/skills/last30days (a stdlib-only engine). Bump deliberately.
+#
+# The yt-dlp on PATH is a shim adding `--compat-options no-certifi`: yt-dlp
+# otherwise trusts only its bundled certifi store and rejects the gateway's
+# TLS-intercepting CA, which SSL_CERT_FILE supplies to the system store. A
+# yt-dlp config file cannot carry this — callers pass --ignore-config.
+ARG UV_VERSION=0.12.18
+ARG PYTHON_VERSION=3.12
+ARG YT_DLP_VERSION=2026.8.19
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
+    uv python install "${PYTHON_VERSION}" && \
+    ln -sf "$(uv python find --managed-python "${PYTHON_VERSION}")" /usr/local/bin/python3 && \
+    UV_TOOL_DIR=/opt/uv/tools UV_TOOL_BIN_DIR=/opt/uv/bin \
+        uv tool install --python "${PYTHON_VERSION}" "yt-dlp[default,pin]==${YT_DLP_VERSION}" && \
+    printf '#!/bin/sh\nexec /opt/uv/bin/yt-dlp --compat-options no-certifi "$@"\n' > /usr/local/bin/yt-dlp && \
+    chmod 0755 /usr/local/bin/yt-dlp && \
+    chmod -R a+rX /opt/uv && \
+    rm -rf /root/.cache/uv
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

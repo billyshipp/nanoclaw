@@ -1,0 +1,37 @@
+#!/bin/sh
+# last30days launcher: runs the vendored engine headless with every write
+# pinned under /workspace/agent (the container's $HOME is thrown away on exit).
+#
+#   ~/.config/last30days/.env   -> /workspace/agent/state/last30days.env (seeded once)
+#   ~/.local/share/last30days   -> /workspace/agent/state/last30days-share (research.db, briefs)
+#   saved briefs                -> /workspace/agent/research/last30days
+set -e
+
+ENGINE="$(dirname "$(readlink -f "$0")")/engine"
+STATE=/workspace/agent/state
+RESEARCH=/workspace/agent/research/last30days
+
+umask 077
+mkdir -p "$STATE/last30days-share" "$RESEARCH" "$HOME/.config/last30days" "$HOME/.local/share"
+
+# Seeding SETUP_COMPLETE skips the interactive first-run onboarding; there is no
+# one to answer it over Telegram. Keys never go here: a later paid source gets a
+# placeholder and the credential gateway injects the real value.
+if [ ! -f "$STATE/last30days.env" ]; then
+  cat > "$STATE/last30days.env" <<EOF
+SETUP_COMPLETE=true
+FROM_BROWSER=off
+# X comes from the x-read skill, not last30days (no cookies, no double spend).
+EXCLUDE_SOURCES=x
+LAST30DAYS_MEMORY_DIR=$RESEARCH
+LAST30DAYS_LIBRARY_CONTEXT=on
+LAST30DAYS_TRUSTPILOT_NO_BROWSER=1
+EOF
+fi
+chmod 600 "$STATE/last30days.env"
+
+ln -sfn "$STATE/last30days.env" "$HOME/.config/last30days/.env"
+[ -L "$HOME/.local/share/last30days" ] || ln -sfn "$STATE/last30days-share" "$HOME/.local/share/last30days"
+
+export PYTHONDONTWRITEBYTECODE=1 LAST30DAYS_SKIP_KEYCHAIN=1
+exec python3 "$ENGINE/scripts/last30days.py" "$@" --no-browser-cookies
