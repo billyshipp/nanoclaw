@@ -15,7 +15,7 @@ interface MdNode {
 /**
  * Replace `mailto:` links whose address contains `_` with their text. The
  * adapter's GFM parser autolinks bare emails and renders them as
- * `[text](mailto:addr)`; with an `_` in addr (olivia_claw@agentmail.to)
+ * `[text](mailto:addr)`; with an `_` in addr (first_last@example.com)
  * Telegram rejects the whole message ("Can't find end of Italic entity" /
  * "Can't find end of a URL") and delivery is dropped after retries. As plain
  * text the address is escaped normally and Telegram clients still linkify it.

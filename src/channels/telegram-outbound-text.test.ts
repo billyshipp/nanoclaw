@@ -14,19 +14,19 @@ describe('Telegram mailto rendering', () => {
   const render = renderer();
 
   it('renders an underscore email as escaped text, not an unescaped mailto link', () => {
-    const out = render('• *Muse email:* sent from olivia_claw@agentmail.to at 8:54pm.\n• *Memory:* updated.');
+    const out = render('• *Email:* sent from first_last@example.com at 8:54pm.\n• *Memory:* updated.');
     expect(out).not.toContain('mailto:');
-    expect(out).toContain('olivia\\_claw@agentmail\\.to');
+    expect(out).toContain('first\\_last@example\\.com');
     // Every unescaped italic marker must pair up.
     expect((out.match(/(?<!\\)_/g) ?? []).length % 2).toBe(0);
   });
 
   it('handles explicit mailto links with an underscore', () => {
-    expect(render('write [Muse](mailto:muse_claw@agentmail.to)')).toBe('write Muse');
+    expect(render('write [Team](mailto:team_inbox@example.com)')).toBe('write Team');
   });
 
   it('leaves safe mailto links and other links as links', () => {
-    expect(render('mail billy@example.com')).toContain('(mailto:billy@example.com)');
+    expect(render('mail someone@example.com')).toContain('(mailto:someone@example.com)');
     expect(render('[docs](https://example.com/a_b)')).toBe('[docs](https://example.com/a_b)');
   });
 });
