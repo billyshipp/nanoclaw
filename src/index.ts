@@ -50,6 +50,8 @@ async function dispatchResponse(payload: ResponsePayload): Promise<void> {
 // Channel barrel — each enabled channel self-registers on import.
 // Channel skills uncomment lines in channels/index.ts to enable them.
 import './channels/index.js';
+// Local Telegram mailto rendering fix (see the file header).
+import './channels/telegram-mailto.js';
 
 // Modules barrel — imports registration modules, including the singular
 // mailbox composition slot. Imported for side effects.

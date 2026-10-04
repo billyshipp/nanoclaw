@@ -1,11 +1,10 @@
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 import { describe, expect, it } from 'vitest';
 
-import { patchMailtoRendering } from './telegram.js';
+import './telegram-mailto.js';
 
 function renderer(): (md: string) => string {
   const adapter = createTelegramAdapter({ botToken: '1:test', mode: 'polling' });
-  patchMailtoRendering(adapter);
   const converter = (adapter as unknown as { formatConverter: { renderPostable(m: { markdown: string }): string } })
     .formatConverter;
   return (md) => converter.renderPostable({ markdown: md });
