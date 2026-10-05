@@ -80,33 +80,37 @@ async function fetchBotUsername(token: string): Promise<string | null> {
 interface MdNode {
   type: string;
   url?: string;
+  value?: string;
   children?: MdNode[];
 }
 
 /**
- * Replace `mailto:` links whose address contains `_` with their text. The
- * adapter's GFM parser autolinks bare emails and renders them as
- * `[text](mailto:addr)`; with an `_` in addr (first_last@example.com)
- * Telegram rejects the whole message ("Can't find end of Italic entity" /
- * "Can't find end of a URL") and delivery is dropped after retries. As plain
- * text the address is escaped normally and Telegram clients still linkify it.
+ * Replace links whose URL contains `_` with plain text. The adapter's GFM
+ * parser autolinks bare emails and URLs and renders them as `[text](url)`;
+ * with an `_` in the URL (first_last@example.com, ?agent_name=x) Telegram
+ * rejects the whole message ("Can't find end of Italic entity" / "Can't find
+ * end of a URL") and delivery is dropped after retries. As plain text the
+ * URL is escaped normally and Telegram clients still linkify it. A labelled
+ * link keeps its label and shows the URL after it, unless the URL is a
+ * mailto: (the label already names the recipient).
  */
-export function unwrapUnsafeMailtoLinks<T extends MdNode>(node: T): T {
+export function unwrapUnderscoreLinks<T extends MdNode>(node: T): T {
   if (!node.children) return node;
-  const children = node.children.flatMap((child): MdNode[] =>
-    child.type === 'link' && child.url?.startsWith('mailto:') && child.url.includes('_')
-      ? (child.children ?? []).map(unwrapUnsafeMailtoLinks)
-      : [unwrapUnsafeMailtoLinks(child)],
-  );
+  const children = node.children.flatMap((child): MdNode[] => {
+    if (child.type !== 'link' || !child.url?.includes('_')) return [unwrapUnderscoreLinks(child)];
+    const label = (child.children ?? []).map(unwrapUnderscoreLinks);
+    const autolink = label.length === 1 && label[0].type === 'text' && label[0].value === child.url;
+    return autolink || child.url.startsWith('mailto:') ? label : [...label, { type: 'text', value: ` (${child.url})` }];
+  });
   return { ...node, children };
 }
 
-/** Route the adapter's MarkdownV2 renderer through unwrapUnsafeMailtoLinks. */
-export function patchMailtoRendering(adapter: ReturnType<typeof createTelegramAdapter>): void {
+/** Route the adapter's MarkdownV2 renderer through unwrapUnderscoreLinks. */
+export function patchUnderscoreLinkRendering(adapter: ReturnType<typeof createTelegramAdapter>): void {
   // formatConverter is protected in the typings but a plain instance field.
   const converter = (adapter as unknown as { formatConverter: { fromAst(ast: MdNode): string } }).formatConverter;
   const fromAst = converter.fromAst.bind(converter);
-  converter.fromAst = (ast) => fromAst(unwrapUnsafeMailtoLinks(ast));
+  converter.fromAst = (ast) => fromAst(unwrapUnderscoreLinks(ast));
 }
 
 function isGroupPlatformId(platformId: string): boolean {
@@ -411,7 +415,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     botToken: token,
     mode: 'polling',
   });
-  patchMailtoRendering(telegramAdapter);
+  patchUnderscoreLinkRendering(telegramAdapter);
   const bridge = createChatSdkBridge({
     adapter: telegramAdapter,
     instance: options.instanceKey, // undefined ⇒ default instance (keyed by channelType)
