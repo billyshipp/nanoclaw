@@ -8,4 +8,4 @@
 
 import './cli.js';
 import './telegram.js';
-import './agentmail.js';
+import './agentmail.js'; // local channel, not in the channels registry — keeps /update-nanoclaw from trying to refresh it
