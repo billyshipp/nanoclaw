@@ -29,14 +29,32 @@
  *                           "polling"), AGENTMAIL_POLL_SCHEDULE (cron
  *                           expression, polling mode only, default
  *                           "0 4,10,16,22 * * *"), AGENTMAIL_WEBHOOK_SECRET
- *                           (webhook mode only, required in that mode)
+ *                           (webhook mode only, required in that mode),
+ *                           AGENTMAIL_INBOUND_ALLOW (comma-separated
+ *                           addresses and/or "@domain" entries; when set,
+ *                           only mail from these senders is routed as a
+ *                           chat message — everything else stays in the
+ *                           inbox for the agent to read via the API, and
+ *                           never triggers a channel-approval card)
+ *
+ * Inbound text is prefixed with a short header (from, subject, thread and
+ * message ids, attachments) so the agent can reply in-thread or fetch
+ * attachments through the AgentMail API. The body is AgentMail's
+ * extracted_text (quoted history stripped) when available.
+ *
+ * Polling state (cursor, recent ids, last inbound message per correspondent)
+ * persists to data/agentmail-state.json so a host restart neither drops mail
+ * that arrived while it was down nor loses reply threading.
  */
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { CronExpressionParser } from 'cron-parser';
 
 import { AgentMailClient } from 'agentmail';
 import { Webhook as SvixWebhook } from 'svix';
 
-import { TIMEZONE } from '../config.js';
+import { DATA_DIR, TIMEZONE } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerWebhookHandler } from '../webhook-server.js';
@@ -44,7 +62,12 @@ import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } f
 import { registerChannelAdapter } from './channel-registry.js';
 
 const REQUIRED_ENV = ['AGENTMAIL_API_KEY', 'AGENTMAIL_INBOX_ID'] as const;
-const OPTIONAL_ENV = ['AGENTMAIL_MODE', 'AGENTMAIL_POLL_SCHEDULE', 'AGENTMAIL_WEBHOOK_SECRET'] as const;
+const OPTIONAL_ENV = [
+  'AGENTMAIL_MODE',
+  'AGENTMAIL_POLL_SCHEDULE',
+  'AGENTMAIL_WEBHOOK_SECRET',
+  'AGENTMAIL_INBOUND_ALLOW',
+] as const;
 type AgentMailEnv = { [K in (typeof REQUIRED_ENV)[number]]: string } & {
   [K in (typeof OPTIONAL_ENV)[number]]?: string;
 };
@@ -54,12 +77,84 @@ const DEFAULT_POLL_SCHEDULE = '0 4,10,16,22 * * *';
 // `after` cutoff could otherwise be delivered twice. Bounded so it never
 // grows unbounded over a long-running process.
 const MAX_SEEN_IDS = 500;
+// On startup, resume from the persisted cursor only if it is this recent —
+// a very stale cursor would replay weeks of mail into the agent.
+const MAX_RESUME_AGE_MS = 3 * 24 * 60 * 60 * 1000;
+const STATE_PATH = path.join(DATA_DIR, 'agentmail-state.json');
 
 /** "user@domain.com" or "Display Name <user@domain.com>" → bare address. */
 function extractAddress(from: string): string | null {
   const angleMatch = from.match(/<([^>]+)>/);
   const addr = (angleMatch ? angleMatch[1] : from).trim();
   return addr.includes('@') ? addr : null;
+}
+
+/** Parse AGENTMAIL_INBOUND_ALLOW. Empty/unset → null (route every sender). */
+export function parseInboundAllow(raw: string | undefined): string[] | null {
+  const entries = (raw ?? '')
+    .split(',')
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return entries.length ? entries : null;
+}
+
+/** Exact address match, or "@domain" suffix match. */
+export function senderAllowed(address: string, allow: string[] | null): boolean {
+  if (!allow) return true;
+  const addr = address.toLowerCase();
+  return allow.some((e) => (e.startsWith('@') ? addr.endsWith(e) : addr === e));
+}
+
+export interface InboundEmail {
+  messageId: string;
+  threadId?: string | null;
+  from: string;
+  subject?: string | null;
+  text?: string | null;
+  extractedText?: string | null;
+  attachments?: Array<{ attachmentId: string; filename?: string | null; size?: number | null }> | null;
+}
+
+function humanSize(bytes: number | null | undefined): string {
+  if (!bytes) return '?';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Header + body text handed to the agent for one inbound email. */
+export function formatInboundText(m: InboundEmail): string {
+  const lines = [`[email] From: ${m.from}`, `Subject: ${m.subject || '(no subject)'}`];
+  lines.push(`thread_id: ${m.threadId ?? '?'} | message_id: ${m.messageId}`);
+  const atts = m.attachments ?? [];
+  if (atts.length) {
+    lines.push(
+      'Attachments: ' +
+        atts.map((a) => `${a.filename || 'unnamed'} (${humanSize(a.size)}, id ${a.attachmentId})`).join('; '),
+    );
+  }
+  const body = (m.extractedText || m.text || '').trim();
+  return `${lines.join('\n')}\n\n${body}`;
+}
+
+interface PersistedState {
+  lastPollTime?: string;
+  seen?: string[];
+  lastInbound?: Record<string, string>;
+}
+
+function loadState(): PersistedState {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8')) as PersistedState;
+  } catch {
+    return {};
+  }
+}
+
+interface WireAttachment {
+  attachment_id: string;
+  filename?: string | null;
+  size?: number | null;
 }
 
 interface WireMessage {
@@ -69,6 +164,7 @@ interface WireMessage {
   subject?: string | null;
   text?: string | null;
   extracted_text?: string | null;
+  attachments?: WireAttachment[] | null;
 }
 
 interface WireEvent {
@@ -83,17 +179,32 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
   const inboxId = env.AGENTMAIL_INBOX_ID;
   const mode = env.AGENTMAIL_MODE === 'webhook' ? 'webhook' : 'polling';
   const pollSchedule = env.AGENTMAIL_POLL_SCHEDULE || DEFAULT_POLL_SCHEDULE;
+  const inboundAllow = parseInboundAllow(env.AGENTMAIL_INBOUND_ALLOW);
+  const persisted = loadState();
 
   // Reply-vs-cold-send state: the last inbound message id per correspondent,
   // so a reply threads properly via AgentMail's own In-Reply-To handling.
-  // In-memory only — a host restart falls back to a cold send for that
-  // correspondent's next reply, same tradeoff as Resend's ThreadResolver.
-  const lastInboundMessageId = new Map<string, string>();
+  // Persisted with the poll cursor so a restart keeps reply threading.
+  const lastInboundMessageId = new Map<string, string>(Object.entries(persisted.lastInbound ?? {}));
   let connected = false;
 
   // --- polling mode state ---
-  const seenMessageIds = new Set<string>();
+  const seenMessageIds = new Set<string>(persisted.seen ?? []);
   let lastPollTime = new Date();
+
+  function saveState(): void {
+    const state: PersistedState = {
+      lastPollTime: lastPollTime.toISOString(),
+      seen: [...seenMessageIds],
+      lastInbound: Object.fromEntries(lastInboundMessageId),
+    };
+    try {
+      fs.writeFileSync(`${STATE_PATH}.tmp`, JSON.stringify(state));
+      fs.renameSync(`${STATE_PATH}.tmp`, STATE_PATH);
+    } catch (err) {
+      log.warn('AgentMail: could not persist state', { err });
+    }
+  }
   let pollTimeout: ReturnType<typeof setTimeout> | null = null;
   let polling = false;
 
@@ -113,12 +224,18 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
     }, delayMs);
   }
 
-  async function deliverInbound(config: ChannelSetup, messageId: string, from: string, text: string): Promise<void> {
+  async function deliverInbound(config: ChannelSetup, email: InboundEmail): Promise<void> {
+    const { messageId, from } = email;
     const address = extractAddress(from);
     if (!address) {
       log.warn('AgentMail: could not extract sender address', { from });
       return;
     }
+    if (!senderAllowed(address, inboundAllow)) {
+      log.debug('AgentMail: sender not in AGENTMAIL_INBOUND_ALLOW, left in inbox', { address, messageId });
+      return;
+    }
+    const text = formatInboundText(email);
     const platformId = `agentmail:${address}`;
     lastInboundMessageId.set(platformId, messageId);
     try {
@@ -167,10 +284,19 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
         }
 
         const full = await client.inboxes.messages.get(inboxId, item.messageId);
-        await deliverInbound(config, item.messageId, item.from, full.text || full.extractedText || '');
+        await deliverInbound(config, {
+          messageId: item.messageId,
+          threadId: full.threadId,
+          from: item.from,
+          subject: full.subject,
+          text: full.text,
+          extractedText: full.extractedText,
+          attachments: full.attachments,
+        });
       }
 
       lastPollTime = items[items.length - 1].createdAt;
+      saveState();
     } catch (err) {
       log.error('AgentMail: poll failed', { err });
     } finally {
@@ -215,7 +341,20 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
 
       if (event.event_type !== 'message.received' || !event.message) return;
       const msg = event.message;
-      await deliverInbound(config, msg.message_id, msg.from, msg.text || msg.extracted_text || '');
+      await deliverInbound(config, {
+        messageId: msg.message_id,
+        threadId: msg.thread_id,
+        from: msg.from,
+        subject: msg.subject,
+        text: msg.text,
+        extractedText: msg.extracted_text,
+        attachments: (msg.attachments ?? []).map((a) => ({
+          attachmentId: a.attachment_id,
+          filename: a.filename,
+          size: a.size,
+        })),
+      });
+      saveState();
     });
   }
 
@@ -234,11 +373,17 @@ function createAdapter(env: AgentMailEnv): ChannelAdapter {
         setupWebhook(config);
         log.info('AgentMail: adapter ready (webhook mode)', { inboxId });
       } else {
-        lastPollTime = new Date();
+        const resumeFrom = persisted.lastPollTime ? new Date(persisted.lastPollTime) : null;
+        lastPollTime =
+          resumeFrom && !isNaN(resumeFrom.getTime()) && Date.now() - resumeFrom.getTime() < MAX_RESUME_AGE_MS
+            ? resumeFrom
+            : new Date();
         scheduleNextPoll(config);
         log.info('AgentMail: adapter ready (polling mode)', {
           inboxId,
           pollSchedule,
+          resumeFrom: lastPollTime.toISOString(),
+          inboundAllow,
           nextPollAt: nextOccurrence().toISOString(),
         });
       }
