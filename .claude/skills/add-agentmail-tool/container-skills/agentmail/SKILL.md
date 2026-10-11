@@ -40,7 +40,7 @@ mail open | mail followups [--days 3] | mail log | mail check
 ```
 
 - Bodies are Markdown (`**bold**`, `- bullets`, `[links](https://...)`), sent as HTML plus plain text with your signature. Add `--dry-run` to preview.
-- Recipients: an address, a `known` name, `owner` (only when the owner has one address), or `owner:<label>`. With several owner addresses, plain `owner` is refused on purpose: pick by topic per `policy.md`.
+- Recipients: an address, a `known` name, `owner` (only when the owner has one address), or `owner:<label>`. The owner's first name works in place of `owner` (`alex:work`). With several owner addresses, plain `owner` is refused on purpose: pick by topic per `policy.md`.
 - Replying to a thread id answers the latest message not sent by you.
 
 ## Rules `mail` enforces

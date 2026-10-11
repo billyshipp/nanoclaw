@@ -178,21 +178,30 @@ export const ownerAddresses = (cfg: Config) => lower(Object.values(cfg.owner));
 const knownAddresses = (cfg: Config) => lower(Object.values(cfg.known ?? {}));
 const ownerName = (cfg: Config) => cfg.owner_name || 'the owner';
 
+/** Alias prefixes for the owner: "owner", plus the owner's first name when set ("alex:work"). */
+function ownerPrefixes(cfg: Config): string[] {
+  const name = (cfg.owner_name || '').trim().toLowerCase();
+  return /^[a-z][\w-]*$/.test(name) && name !== 'owner' ? ['owner', name] : ['owner'];
+}
+
 export function resolveAlias(token: string, cfg: Config): string {
   const t = token.trim();
   const low = t.toLowerCase();
   const labels = Object.keys(cfg.owner);
-  if (low === 'owner' || low === 'me' || low === 'owner:') {
+  const prefixes = ownerPrefixes(cfg);
+  const choices = () => labels.map((l) => `${prefixes.at(-1)}:${l} (${cfg.owner[l]})`).join(', ');
+  if (low === 'me' || prefixes.some((p) => low === p || low === `${p}:`)) {
     if (labels.length === 1) return cfg.owner[labels[0]].toLowerCase();
     throw new MailError(
-      `which address for ${ownerName(cfg)}? Use one of: ${labels.map((l) => `owner:${l} (${cfg.owner[l]})`).join(', ')}. ` +
+      `which address for ${ownerName(cfg)}? Use one of: ${choices()}. ` +
         'Pick the one that matches the topic (see email/policy.md).',
     );
   }
-  if (low.startsWith('owner:')) {
-    const key = low.slice('owner:'.length);
+  const prefix = prefixes.find((p) => low.startsWith(`${p}:`));
+  if (prefix) {
+    const key = low.slice(prefix.length + 1);
     const hit = labels.find((l) => l.toLowerCase() === key);
-    if (!hit) throw new MailError(`unknown owner alias ${JSON.stringify(t)}; use one of: ${labels.map((l) => 'owner:' + l).join(', ')}`);
+    if (!hit) throw new MailError(`unknown owner alias ${JSON.stringify(t)}; use one of: ${choices()}`);
     return cfg.owner[hit].toLowerCase();
   }
   const known = Object.entries(cfg.known ?? {}).find(([k]) => k.toLowerCase() === low);
@@ -1082,7 +1091,7 @@ const USAGE = `mail: email tool for this agent's AgentMail inbox
   mail check         (verify the inbox is reachable through the gateway)
   mail gate          (scheduled-task gate; prints {"wakeAgent": ..., "data": ...})
 
-Recipients: an address, owner / owner:<label>, or a name from "known" in email/config.json.
+Recipients: an address, owner / owner:<label> (or <owner_name>:<label>), or a name from "known" in email/config.json.
 Statuses: ${STATUSES.join(', ')}.
 Policy lives in email/policy.md and is enforced here.`;
 

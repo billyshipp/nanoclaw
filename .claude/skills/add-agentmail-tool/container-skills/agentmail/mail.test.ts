@@ -93,6 +93,13 @@ describe('address policy', () => {
     expect(mail.resolveAlias('Vendor <V@Shop.example>', cfg)).toBe('v@shop.example');
   });
 
+  it("accepts the owner's first name as an alias prefix", () => {
+    expect(mail.resolveAlias('alex:work', cfg)).toBe('alex@acme.example');
+    expect(mail.resolveAlias('Alex:Personal', cfg)).toBe('alex.r@mail.example');
+    expect(() => mail.resolveAlias('alex', cfg)).toThrow(/alex:work/);
+    expect(() => mail.resolveAlias('alex:typo', cfg)).toThrow(/unknown owner alias/);
+  });
+
   it('refuses owner lookalikes', () => {
     expect(() => mail.checkRecipients(['alex@acme.example.com'], cfg)).toThrow(/looks like Alex/);
   });
