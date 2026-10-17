@@ -8,5 +8,9 @@
     "name": "@anthropic-ai/claude-code",
     "version": "2.1.296",
     "onlyBuilt": true
+  },
+  {
+    "name": "@getdial/cli",
+    "version": "0.37.0"
   }
 ]
